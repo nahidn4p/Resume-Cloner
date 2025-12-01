@@ -78,7 +78,7 @@ An intelligent resume transformation tool that converts any resume (PDF, DOCX, o
 ## Project Structure
 
 ```
-resume-script/
+resume-cloner/
 ├── main.py                 # Main application code
 ├── requirements.txt        # Python dependencies
 ├── main_resume.docx       # Your resume template (required)
