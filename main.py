@@ -100,8 +100,8 @@ def extract_with_llama70b(text):
 
 def generate_summary_from_resume(text, experience_data, education_data, skills_data):
     """
-    Generate a professional summary if the extracted summary is empty.
-    Uses the candidate's experience, education, and skills to create a summary.
+    Generate a structured professional summary in the format of main_resume.docx.
+    Creates categories like: Primary Roles, Backend, Frontend, Database, Cloud/DevOps, etc.
     """
     # Build context from extracted data
     exp_text = ""
@@ -109,39 +109,45 @@ def generate_summary_from_resume(text, experience_data, education_data, skills_d
         for exp in experience_data[:3]:  # Use top 3 experiences
             exp_text += f"{exp.get('title', '')} at {exp.get('company', '')} ({exp.get('dates', '')}). "
     
-    edu_text = ""
-    if education_data:
-        for edu in education_data:
-            edu_text += f"{edu.get('degree', '')} from {edu.get('school', '')}. "
-    
-    skills_text = ""
+    skills_list = []
     if isinstance(skills_data, list):
-        skills_text = ", ".join(str(s) for s in skills_data[:15])  # Top 15 skills
+        skills_list = [str(s).strip() for s in skills_data if s]
     elif skills_data:
-        skills_text = str(skills_data)
+        skills_list = [s.strip() for s in str(skills_data).split(",") if s.strip()]
+    
+    skills_text = ", ".join(skills_list[:20])  # Top 20 skills for context
     
     prompt = f"""
-    Generate a professional resume summary (2-3 sentences, maximum 150 words) for a candidate based on the following information:
+    Based on the following candidate information, generate a structured resume summary in this EXACT format (each line on a new line):
     
-    Experience: {exp_text}
-    Education: {edu_text}
-    Key Skills: {skills_text}
+    Primary Roles: [list 2-3 primary roles like "Data Scientist, Computer Vision Engineer, ML Engineer"]
+    Backend: [list backend technologies, e.g., "Python, Java, Spark, Hadoop"]
+    Frontend: [list frontend technologies if any, or "N/A"]
+    API: [list API types, e.g., "REST, GraphQL"]
+    Database: [list databases, e.g., "MySQL, MongoDB, Cassandra, Oracle"]
+    Cloud/DevOps: [list cloud platforms and DevOps tools, e.g., "AWS, Azure, Docker, Kubernetes"]
+    DevOps: [list additional DevOps tools, e.g., "Jenkins, Terraform, GitLab"]
+    Leadership: [mention leadership/mentoring if applicable, or "N/A"]
+    Industry: [mention industries if available, or "N/A"]
     
-    The summary should:
-    - Highlight years of experience and primary roles
-    - Mention key technical skills and expertise areas
-    - Be professional and ATS-friendly
-    - Be concise and impactful
+    Experience context: {exp_text}
+    Skills available: {skills_text}
     
-    Return ONLY the summary text, no labels or formatting.
+    IMPORTANT:
+    - Categorize skills appropriately
+    - Use the exact format above with colons
+    - Each category on a separate line
+    - Only include categories that have relevant skills
+    - Be concise (3-5 items per category max)
+    - Return ONLY the formatted text, no additional explanation
     """
     
     try:
         chat = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,  # Slightly higher for more natural language
-            max_tokens=200
+            temperature=0.5,
+            max_tokens=400
         )
         summary = chat.choices[0].message.content.strip()
         # Clean up any quotes or extra formatting
@@ -189,19 +195,25 @@ def apply_ATS_template(template_bytes, data):
         r.bold = True
         r.font.size = Pt(10)
         
-        # Add the new summary text as a new paragraph after the heading
+        # Add the new summary text - handle structured format with multiple lines
         if data.get("summary"):
             summary_text = str(data["summary"]).strip()
             if summary_text:
-                # Insert summary as a new paragraph after the heading
-                if summary_idx + 1 < len(doc.paragraphs):
-                    anchor = doc.paragraphs[summary_idx + 1]
-                    new_p = anchor.insert_paragraph_before(summary_text)
-                else:
-                    new_p = doc.add_paragraph(summary_text)
-                # Set font size for summary text
-                for run in new_p.runs:
-                    run.font.size = Pt(10)
+                # Split by newlines to handle structured format (each category on separate line)
+                summary_lines = [line.strip() for line in summary_text.split('\n') if line.strip()]
+                insert_pos = summary_idx + 1
+                
+                for line in summary_lines:
+                    # Insert each line as a separate paragraph
+                    if insert_pos < len(doc.paragraphs):
+                        anchor = doc.paragraphs[insert_pos]
+                        new_p = anchor.insert_paragraph_before(line)
+                    else:
+                        new_p = doc.add_paragraph(line)
+                    # Set font size for summary text
+                    for run in new_p.runs:
+                        run.font.size = Pt(10)
+                    insert_pos += 1
 
     # === 3. Portfolio links ===
     portfolio_idx = None
@@ -252,59 +264,168 @@ def apply_ATS_template(template_bytes, data):
             _insert_after_portfolio(f"GitHub: {data['github']}")
 
     # === 4. Skill Matrix ===
-    # The skill matrix is NOT a table - it's paragraphs with "Application/Software Development" as a subheading
-    # Handle skills as either a string or a list
+    # The skill matrix has categories: Application/Software Development, Database/SQL, Cloud/AWS/DevOps, Tools/IDE
+    # Each category has descriptive bullet points, not just skill lists
     skills_raw = data.get("skills", "")
     if isinstance(skills_raw, list):
         skills_list = [str(s).strip() for s in skills_raw if s]
     else:
-        # If it's a string, split by comma
         skills_text = str(skills_raw).strip() if skills_raw else ""
         skills_list = [s.strip() for s in skills_text.split(",") if s.strip()] if skills_text else []
     
     if skills_list:
-        # Find "Application/Software Development" paragraph
-        app_dev_idx = None
-        for i, para in enumerate(doc.paragraphs):
-            if "Application/Software Development" in para.text:
-                app_dev_idx = i
-                break
+        # Generate categorized skill matrix content using LLM
+        experience_context = ""
+        if data.get("experience"):
+            for exp in data.get("experience", [])[:2]:
+                experience_context += f"{exp.get('title', '')} at {exp.get('company', '')}. "
         
-        if app_dev_idx is not None:
-            # Find the end of the skill matrix section (before next major heading)
-            end_idx = app_dev_idx + 1
-            while end_idx < len(doc.paragraphs):
-                text = doc.paragraphs[end_idx].text.strip()
-                if not text:
-                    end_idx += 1
-                    continue
-                # Stop at next major section
-                if any(h in text for h in ("Database/SQL", "Cloud/AWS", "Tools/IDE", "EDUCATION", "WORK EXPERIENCE")):
+        skills_text_for_prompt = ", ".join(skills_list)
+        
+        prompt = f"""
+        Based on the candidate's skills and experience, generate a skill matrix in this EXACT format:
+        
+        For each category below, create 3-5 descriptive bullet points (not just skill lists) that describe experience and expertise.
+        Use the format: "Experience/description with [relevant skills mentioned naturally]"
+        
+        Application/Software Development:
+        [3-5 bullet points describing software development experience, mentioning specific technologies from the skills list]
+        
+        Database/SQL/Relational Database/NoSQL:
+        [3-5 bullet points describing database experience, mentioning specific databases from the skills list]
+        
+        Cloud/AWS/DevOps:
+        [3-5 bullet points describing cloud and DevOps experience, mentioning specific tools/platforms from the skills list]
+        
+        Tools/IDE/Editors:
+        [2-3 bullet points listing tools and IDEs, or combine with other tools if applicable]
+        
+        Skills available: {skills_text_for_prompt}
+        Experience context: {experience_context}
+        
+        IMPORTANT:
+        - Each bullet should be a complete sentence describing experience/expertise
+        - Naturally incorporate skill names into descriptive sentences
+        - Follow the format of professional resume bullet points
+        - Use the exact category names above
+        - Return ONLY the formatted text with category headers and bullets
+        """
+        
+        try:
+            chat = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=800
+            )
+            skill_matrix_content = chat.choices[0].message.content.strip()
+            
+            # Parse and insert the skill matrix content
+            # Find "Application/Software Development" paragraph
+            app_dev_idx = None
+            for i, para in enumerate(doc.paragraphs):
+                if "Application/Software Development" in para.text:
+                    app_dev_idx = i
                     break
-                end_idx += 1
             
-            # Remove all old skill paragraphs (everything after "Application/Software Development")
-            for p in doc.paragraphs[app_dev_idx + 1:end_idx]:
-                p._element.getparent().remove(p._element)
-            
-            # Add skills as bullet points after "Application/Software Development"
-            # Format: join skills with commas and newlines for readability
-            # Group skills into lines (e.g., 3-4 skills per line)
-            skills_text = ", ".join(skills_list)
-            # Split into chunks for better formatting (optional - can be one long line)
-            # For now, just use comma-separated on one line, or newline-separated
-            formatted_skills = ", ".join(skills_list)
-            
-            # Insert as a new paragraph after "Application/Software Development"
-            if app_dev_idx + 1 < len(doc.paragraphs):
-                anchor = doc.paragraphs[app_dev_idx + 1]
-                new_p = anchor.insert_paragraph_before(formatted_skills)
-            else:
-                new_p = doc.add_paragraph(formatted_skills)
-            
-            # Set font size to match template
-            for run in new_p.runs:
-                run.font.size = Pt(10)
+            if app_dev_idx is not None:
+                # Find the end of the skill matrix section (before EDUCATION or WORK EXPERIENCE)
+                end_idx = app_dev_idx + 1
+                while end_idx < len(doc.paragraphs):
+                    text = doc.paragraphs[end_idx].text.strip()
+                    if not text:
+                        end_idx += 1
+                        continue
+                    # Stop at next major section
+                    if any(h in text for h in ("EDUCATION", "WORK EXPERIENCE")):
+                        break
+                    end_idx += 1
+                
+                # Remove all old skill paragraphs
+                for p in doc.paragraphs[app_dev_idx + 1:end_idx]:
+                    p._element.getparent().remove(p._element)
+                
+                # Parse the LLM response and insert structured content
+                lines = skill_matrix_content.split('\n')
+                current_category = None
+                insert_pos = app_dev_idx + 1
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Check if this is a category header
+                    if "Application/Software Development" in line:
+                        current_category = "Application/Software Development"
+                        # The category header already exists, skip
+                        continue
+                    elif "Database/SQL" in line or "Database" in line:
+                        current_category = "Database/SQL/Relational Database/NoSQL"
+                        # Insert category header
+                        if insert_pos < len(doc.paragraphs):
+                            anchor = doc.paragraphs[insert_pos]
+                            new_p = anchor.insert_paragraph_before(current_category)
+                        else:
+                            new_p = doc.add_paragraph(current_category)
+                        for run in new_p.runs:
+                            run.font.size = Pt(10)
+                        insert_pos += 1
+                        continue
+                    elif "Cloud/AWS" in line or "Cloud" in line or "DevOps" in line:
+                        current_category = "Cloud/AWS/DevOps"
+                        # Insert category header
+                        if insert_pos < len(doc.paragraphs):
+                            anchor = doc.paragraphs[insert_pos]
+                            new_p = anchor.insert_paragraph_before(current_category)
+                        else:
+                            new_p = doc.add_paragraph(current_category)
+                        for run in new_p.runs:
+                            run.font.size = Pt(10)
+                        insert_pos += 1
+                        continue
+                    elif "Tools/IDE" in line or "Tools" in line:
+                        current_category = "Tools/IDE/Editors"
+                        # Insert category header
+                        if insert_pos < len(doc.paragraphs):
+                            anchor = doc.paragraphs[insert_pos]
+                            new_p = anchor.insert_paragraph_before(current_category)
+                        else:
+                            new_p = doc.add_paragraph(current_category)
+                        for run in new_p.runs:
+                            run.font.size = Pt(10)
+                        insert_pos += 1
+                        continue
+                    
+                    # This is a bullet point (starts with - or • or number)
+                    if line.startswith('-') or line.startswith('•') or line.startswith('*') or (line[0].isdigit() and '.' in line[:3]):
+                        # Remove bullet markers
+                        bullet_text = line.lstrip('- •*0123456789. ')
+                        if bullet_text:
+                            # Insert as bullet paragraph
+                            if insert_pos < len(doc.paragraphs):
+                                anchor = doc.paragraphs[insert_pos]
+                                new_p = anchor.insert_paragraph_before(bullet_text)
+                            else:
+                                new_p = doc.add_paragraph(bullet_text)
+                            # Try to apply bullet style
+                            try:
+                                # Look for bullet style
+                                bullet_style = None
+                                for style in doc.styles:
+                                    if "bullet" in style.name.lower() or "list" in style.name.lower():
+                                        bullet_style = style.name
+                                        break
+                                if bullet_style:
+                                    new_p.style = bullet_style
+                            except:
+                                pass
+                            for run in new_p.runs:
+                                run.font.size = Pt(10)
+                            insert_pos += 1
+        except Exception as e:
+            # If generation fails, fall back to simple skill list
+            pass
 
     # === 5. Education ===
     edu_start = None
