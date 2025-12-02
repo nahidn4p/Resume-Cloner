@@ -98,6 +98,59 @@ def extract_with_llama70b(text):
     import json
     return json.loads(m.group())
 
+def generate_summary_from_resume(text, experience_data, education_data, skills_data):
+    """
+    Generate a professional summary if the extracted summary is empty.
+    Uses the candidate's experience, education, and skills to create a summary.
+    """
+    # Build context from extracted data
+    exp_text = ""
+    if experience_data:
+        for exp in experience_data[:3]:  # Use top 3 experiences
+            exp_text += f"{exp.get('title', '')} at {exp.get('company', '')} ({exp.get('dates', '')}). "
+    
+    edu_text = ""
+    if education_data:
+        for edu in education_data:
+            edu_text += f"{edu.get('degree', '')} from {edu.get('school', '')}. "
+    
+    skills_text = ""
+    if isinstance(skills_data, list):
+        skills_text = ", ".join(str(s) for s in skills_data[:15])  # Top 15 skills
+    elif skills_data:
+        skills_text = str(skills_data)
+    
+    prompt = f"""
+    Generate a professional resume summary (2-3 sentences, maximum 150 words) for a candidate based on the following information:
+    
+    Experience: {exp_text}
+    Education: {edu_text}
+    Key Skills: {skills_text}
+    
+    The summary should:
+    - Highlight years of experience and primary roles
+    - Mention key technical skills and expertise areas
+    - Be professional and ATS-friendly
+    - Be concise and impactful
+    
+    Return ONLY the summary text, no labels or formatting.
+    """
+    
+    try:
+        chat = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,  # Slightly higher for more natural language
+            max_tokens=200
+        )
+        summary = chat.choices[0].message.content.strip()
+        # Clean up any quotes or extra formatting
+        summary = summary.strip('"').strip("'").strip()
+        return summary
+    except Exception as e:
+        # If generation fails, return empty string
+        return ""
+
 def apply_ATS_template(template_bytes, data):
     doc = Document(io.BytesIO(template_bytes))
 
@@ -106,18 +159,49 @@ def apply_ATS_template(template_bytes, data):
     doc.paragraphs[1].runs[0].text = f"{data['location']} | Email: {data['email']} | Phone {data['phone']}"
 
     # === 2. Summary ===
-    summary_para = None
-    for p in doc.paragraphs:
+    summary_idx = None
+    for i, p in enumerate(doc.paragraphs):
         if p.text.strip().startswith("SUMMARY"):
-            summary_para = p
+            summary_idx = i
             break
-    if summary_para:
-        # replace everything after SUMMARY
+    if summary_idx is not None:
+        summary_para = doc.paragraphs[summary_idx]
+        
+        # Find the end of the summary block (before the next major heading)
+        end_idx = summary_idx + 1
+        while end_idx < len(doc.paragraphs):
+            text = doc.paragraphs[end_idx].text.strip()
+            if not text:
+                end_idx += 1
+                continue
+            # Stop at next major section
+            if any(h in text for h in ("PORTFOLIO", "WORK AUTHORIZATION", "SKILL MATRIX", "EDUCATION", "WORK EXPERIENCE")):
+                break
+            end_idx += 1
+        
+        # Remove all old summary content paragraphs (everything after the heading)
+        for p in doc.paragraphs[summary_idx + 1:end_idx]:
+            p._element.getparent().remove(p._element)
+        
+        # Clear and rewrite the SUMMARY heading paragraph
         summary_para.clear()
         r = summary_para.add_run("SUMMARY")
         r.bold = True
         r.font.size = Pt(10)
-        summary_para.add_run("\n" + data["summary"])
+        
+        # Add the new summary text as a new paragraph after the heading
+        if data.get("summary"):
+            summary_text = str(data["summary"]).strip()
+            if summary_text:
+                # Insert summary as a new paragraph after the heading
+                if summary_idx + 1 < len(doc.paragraphs):
+                    anchor = doc.paragraphs[summary_idx + 1]
+                    new_p = anchor.insert_paragraph_before(summary_text)
+                else:
+                    new_p = doc.add_paragraph(summary_text)
+                # Set font size for summary text
+                for run in new_p.runs:
+                    run.font.size = Pt(10)
 
     # === 3. Portfolio links ===
     portfolio_idx = None
@@ -167,11 +251,60 @@ def apply_ATS_template(template_bytes, data):
         if data.get("github"):
             _insert_after_portfolio(f"GitHub: {data['github']}")
 
-    # === 4. Skill Matrix (the beautiful table) ===
-    for table in doc.tables:
-        if len(table.rows) > 5 and "Application/Software Development" in table.cell(0,0).text:
-            table.cell(1,0).text = data["skills"].replace(", ", "\n")
-            break
+    # === 4. Skill Matrix ===
+    # The skill matrix is NOT a table - it's paragraphs with "Application/Software Development" as a subheading
+    # Handle skills as either a string or a list
+    skills_raw = data.get("skills", "")
+    if isinstance(skills_raw, list):
+        skills_list = [str(s).strip() for s in skills_raw if s]
+    else:
+        # If it's a string, split by comma
+        skills_text = str(skills_raw).strip() if skills_raw else ""
+        skills_list = [s.strip() for s in skills_text.split(",") if s.strip()] if skills_text else []
+    
+    if skills_list:
+        # Find "Application/Software Development" paragraph
+        app_dev_idx = None
+        for i, para in enumerate(doc.paragraphs):
+            if "Application/Software Development" in para.text:
+                app_dev_idx = i
+                break
+        
+        if app_dev_idx is not None:
+            # Find the end of the skill matrix section (before next major heading)
+            end_idx = app_dev_idx + 1
+            while end_idx < len(doc.paragraphs):
+                text = doc.paragraphs[end_idx].text.strip()
+                if not text:
+                    end_idx += 1
+                    continue
+                # Stop at next major section
+                if any(h in text for h in ("Database/SQL", "Cloud/AWS", "Tools/IDE", "EDUCATION", "WORK EXPERIENCE")):
+                    break
+                end_idx += 1
+            
+            # Remove all old skill paragraphs (everything after "Application/Software Development")
+            for p in doc.paragraphs[app_dev_idx + 1:end_idx]:
+                p._element.getparent().remove(p._element)
+            
+            # Add skills as bullet points after "Application/Software Development"
+            # Format: join skills with commas and newlines for readability
+            # Group skills into lines (e.g., 3-4 skills per line)
+            skills_text = ", ".join(skills_list)
+            # Split into chunks for better formatting (optional - can be one long line)
+            # For now, just use comma-separated on one line, or newline-separated
+            formatted_skills = ", ".join(skills_list)
+            
+            # Insert as a new paragraph after "Application/Software Development"
+            if app_dev_idx + 1 < len(doc.paragraphs):
+                anchor = doc.paragraphs[app_dev_idx + 1]
+                new_p = anchor.insert_paragraph_before(formatted_skills)
+            else:
+                new_p = doc.add_paragraph(formatted_skills)
+            
+            # Set font size to match template
+            for run in new_p.runs:
+                run.font.size = Pt(10)
 
     # === 5. Education ===
     edu_start = None
@@ -266,6 +399,17 @@ def generate_resume(candidate_resume_file):
     raw_text = read_any_resume(candidate_resume_file)
     data = extract_with_llama70b(raw_text)
 
+    # If summary is empty, generate one based on the resume content
+    if not data.get("summary") or not str(data.get("summary", "")).strip():
+        generated_summary = generate_summary_from_resume(
+            raw_text,
+            data.get("experience", []),
+            data.get("education", []),
+            data.get("skills", "")
+        )
+        if generated_summary:
+            data["summary"] = generated_summary
+
     # Load your original template (bundled with the script)
     with open("main_resume.docx", "rb") as f:
         template_bytes = f.read()
@@ -293,4 +437,4 @@ with gr.Blocks(title="ATS-Style Resume Cloner") as demo:
 
     btn.click(generate_resume, inputs=candidate, outputs=[out_docx, out_json])
 
-demo.launch(share=True)
+demo.launch(share=False)
