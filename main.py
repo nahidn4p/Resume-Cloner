@@ -264,8 +264,8 @@ def apply_ATS_template(template_bytes, data):
             _insert_after_portfolio(f"GitHub: {data['github']}")
 
     # === 4. Skill Matrix ===
-    # The skill matrix has categories: Application/Software Development, Database/SQL, Cloud/AWS/DevOps, Tools/IDE
-    # Each category has descriptive bullet points, not just skill lists
+    # Use LLM to analyze resume and create appropriate skill category headers
+    # Then generate descriptive bullet points for each category
     skills_raw = data.get("skills", "")
     if isinstance(skills_raw, list):
         skills_list = [str(s).strip() for s in skills_raw if s]
@@ -274,41 +274,101 @@ def apply_ATS_template(template_bytes, data):
         skills_list = [s.strip() for s in skills_text.split(",") if s.strip()] if skills_text else []
     
     if skills_list:
-        # Generate categorized skill matrix content using LLM
+        # First, analyze skills and experience to determine appropriate category headers
         experience_context = ""
         if data.get("experience"):
-            for exp in data.get("experience", [])[:2]:
-                experience_context += f"{exp.get('title', '')} at {exp.get('company', '')}. "
+            for exp in data.get("experience", [])[:3]:
+                title = exp.get('title', '')
+                company = exp.get('company', '')
+                experience_context += f"{title} at {company}. "
         
         skills_text_for_prompt = ", ".join(skills_list)
         
+        # Step 1: Generate appropriate category headers based on skills and experience
+        header_prompt = f"""
+        Analyze the following candidate's skills and experience, then suggest 3-5 appropriate category headers for organizing their skills in a resume skill matrix.
+        
+        Skills: {skills_text_for_prompt}
+        Experience: {experience_context}
+        
+        Based on the skills and experience, create category headers that logically group the skills. 
+        Examples of good headers:
+        - "Application/Software Development" (for programming languages, frameworks)
+        - "Database/SQL/Relational Database/NoSQL" (for databases)
+        - "Cloud/AWS/DevOps" (for cloud platforms, DevOps tools)
+        - "Machine Learning/Data Science" (for ML/AI skills)
+        - "Frontend Technologies" (for frontend frameworks)
+        - "Tools/IDE/Editors" (for development tools)
+        
+        Return ONLY a comma-separated list of 3-5 category header names. Each header should be descriptive and professional.
+        Example format: "Application/Software Development, Database/SQL/Relational Database/NoSQL, Cloud/AWS/DevOps, Tools/IDE/Editors"
+        """
+        
+        try:
+            header_chat = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": header_prompt}],
+                temperature=0.3,
+                max_tokens=200
+            )
+            headers_response = header_chat.choices[0].message.content.strip()
+            # Parse headers (remove quotes, split by comma)
+            headers_response = headers_response.strip('"').strip("'").strip()
+            category_headers = [h.strip() for h in headers_response.split(",") if h.strip()]
+            
+            # If LLM didn't provide good headers, use defaults
+            if not category_headers or len(category_headers) < 2:
+                category_headers = ["Application/Software Development", "Database/SQL/Relational Database/NoSQL", 
+                                   "Cloud/AWS/DevOps", "Tools/IDE/Editors"]
+        except Exception:
+            # Fallback to default headers
+            category_headers = ["Application/Software Development", "Database/SQL/Relational Database/NoSQL", 
+                               "Cloud/AWS/DevOps", "Tools/IDE/Editors"]
+        
+        # Step 2: Generate skill matrix content with the determined headers
+        headers_text = ", ".join(category_headers)
         prompt = f"""
-        Based on the candidate's skills and experience, generate a skill matrix in this EXACT format:
+        Based on the candidate's skills and experience, generate a professional skill matrix with the following category headers:
+        {headers_text}
         
-        For each category below, create 3-5 descriptive bullet points (not just skill lists) that describe experience and expertise.
-        Use the format: "Experience/description with [relevant skills mentioned naturally]"
+        For each category, create 3-5 descriptive bullet points in professional resume style.
+        Format:
         
-        Application/Software Development:
-        [3-5 bullet points describing software development experience, mentioning specific technologies from the skills list]
+        {category_headers[0]}:
+        - [bullet point describing experience with relevant skills]
+        - [bullet point 2]
+        - [bullet point 3]
         
-        Database/SQL/Relational Database/NoSQL:
-        [3-5 bullet points describing database experience, mentioning specific databases from the skills list]
+        {category_headers[1] if len(category_headers) > 1 else "Category 2"}:
+        - [bullet point 1]
+        - [bullet point 2]
+        - [bullet point 3]
         
-        Cloud/AWS/DevOps:
-        [3-5 bullet points describing cloud and DevOps experience, mentioning specific tools/platforms from the skills list]
-        
-        Tools/IDE/Editors:
-        [2-3 bullet points listing tools and IDEs, or combine with other tools if applicable]
+        [Continue for all categories]
         
         Skills available: {skills_text_for_prompt}
         Experience context: {experience_context}
         
-        IMPORTANT:
+        CRITICAL REQUIREMENTS:
+        - Each category header must appear EXACTLY ONCE
+        - Use the EXACT category header names provided above
+        - Write in professional resume style: use action verbs, be direct and concise
+        - NEVER use phrases like "The candidate has...", "The candidate is...", "As a...", "Having worked as...", "The candidate demonstrated..."
+        - Use direct statements like: "Experience in...", "Proficient in...", "Developed...", "Implemented...", "Skilled in...", "Expertise in...", "Knowledge of...", "Familiarity with..."
+        - Example GOOD bullets:
+          * "Experience in building scalable web applications using Python, Django, and JavaScript"
+          * "Proficient in database design and optimization with MySQL, PostgreSQL, and MongoDB"
+          * "Skilled in deploying cloud infrastructure using AWS EC2, S3, and Lambda"
+        - Example BAD bullets (DO NOT USE):
+          * "The candidate has experience in Python" ❌
+          * "As a developer, the candidate worked with Django" ❌
+          * "Having worked at Company X, the candidate developed..." ❌
         - Each bullet should be a complete sentence describing experience/expertise
         - Naturally incorporate skill names into descriptive sentences
-        - Follow the format of professional resume bullet points
-        - Use the exact category names above
-        - Return ONLY the formatted text with category headers and bullets
+        - Use "- " prefix for each bullet point
+        - Do NOT repeat category headers
+        - Write as if describing your own experience (implied first person, no pronouns)
+        - Return ONLY the formatted text with category headers (once each) and bullets
         """
         
         try:
@@ -321,16 +381,22 @@ def apply_ATS_template(template_bytes, data):
             skill_matrix_content = chat.choices[0].message.content.strip()
             
             # Parse and insert the skill matrix content
-            # Find "Application/Software Development" paragraph
-            app_dev_idx = None
+            # Find the first category header or "SKILL MATRIX" to locate where to start
+            skill_matrix_start_idx = None
             for i, para in enumerate(doc.paragraphs):
-                if "Application/Software Development" in para.text:
-                    app_dev_idx = i
+                # Check if this paragraph matches the first generated category header
+                para_text = para.text.strip()
+                if category_headers and category_headers[0] in para_text:
+                    skill_matrix_start_idx = i
+                    break
+                # Fallback: look for "SKILL MATRIX" or "Application/Software Development"
+                if "SKILL MATRIX" in para_text.upper() or "Application/Software Development" in para_text:
+                    skill_matrix_start_idx = i + 1 if "SKILL MATRIX" in para_text.upper() else i
                     break
             
-            if app_dev_idx is not None:
+            if skill_matrix_start_idx is not None:
                 # Find the end of the skill matrix section (before EDUCATION or WORK EXPERIENCE)
-                end_idx = app_dev_idx + 1
+                end_idx = skill_matrix_start_idx + 1
                 while end_idx < len(doc.paragraphs):
                     text = doc.paragraphs[end_idx].text.strip()
                     if not text:
@@ -342,66 +408,98 @@ def apply_ATS_template(template_bytes, data):
                     end_idx += 1
                 
                 # Remove all old skill paragraphs
-                for p in doc.paragraphs[app_dev_idx + 1:end_idx]:
+                for p in doc.paragraphs[skill_matrix_start_idx + 1:end_idx]:
                     p._element.getparent().remove(p._element)
+                
+                # Check if first category header exists in template - if so, replace it; if not, insert it
+                first_header_exists = False
+                if skill_matrix_start_idx < len(doc.paragraphs) and category_headers:
+                    existing_text = doc.paragraphs[skill_matrix_start_idx].text.strip()
+                    if category_headers[0] in existing_text:
+                        first_header_exists = True
+                        # Replace the existing header text
+                        doc.paragraphs[skill_matrix_start_idx].clear()
+                        doc.paragraphs[skill_matrix_start_idx].add_run(category_headers[0])
+                        for run in doc.paragraphs[skill_matrix_start_idx].runs:
+                            run.font.size = Pt(10)
                 
                 # Parse the LLM response and insert structured content
                 lines = skill_matrix_content.split('\n')
                 current_category = None
-                insert_pos = app_dev_idx + 1
+                insert_pos = skill_matrix_start_idx + 1
+                inserted_categories = set()  # Track which categories have been inserted
+                
+                # Add first category to inserted set if it already exists, or insert it if it doesn't
+                if category_headers:
+                    if first_header_exists:
+                        inserted_categories.add(category_headers[0])
+                        current_category = category_headers[0]
+                    else:
+                        # Insert the first category header
+                        if insert_pos < len(doc.paragraphs):
+                            anchor = doc.paragraphs[insert_pos]
+                            new_p = anchor.insert_paragraph_before(category_headers[0])
+                        else:
+                            new_p = doc.add_paragraph(category_headers[0])
+                        for run in new_p.runs:
+                            run.font.size = Pt(10)
+                        inserted_categories.add(category_headers[0])
+                        current_category = category_headers[0]
+                        insert_pos += 1
                 
                 for line in lines:
                     line = line.strip()
                     if not line:
                         continue
                     
-                    # Check if this is a category header
-                    if "Application/Software Development" in line:
-                        current_category = "Application/Software Development"
-                        # The category header already exists, skip
-                        continue
-                    elif "Database/SQL" in line or "Database" in line:
-                        current_category = "Database/SQL/Relational Database/NoSQL"
-                        # Insert category header
-                        if insert_pos < len(doc.paragraphs):
-                            anchor = doc.paragraphs[insert_pos]
-                            new_p = anchor.insert_paragraph_before(current_category)
-                        else:
-                            new_p = doc.add_paragraph(current_category)
-                        for run in new_p.runs:
-                            run.font.size = Pt(10)
-                        insert_pos += 1
-                        continue
-                    elif "Cloud/AWS" in line or "Cloud" in line or "DevOps" in line:
-                        current_category = "Cloud/AWS/DevOps"
-                        # Insert category header
-                        if insert_pos < len(doc.paragraphs):
-                            anchor = doc.paragraphs[insert_pos]
-                            new_p = anchor.insert_paragraph_before(current_category)
-                        else:
-                            new_p = doc.add_paragraph(current_category)
-                        for run in new_p.runs:
-                            run.font.size = Pt(10)
-                        insert_pos += 1
-                        continue
-                    elif "Tools/IDE" in line or "Tools" in line:
-                        current_category = "Tools/IDE/Editors"
-                        # Insert category header
-                        if insert_pos < len(doc.paragraphs):
-                            anchor = doc.paragraphs[insert_pos]
-                            new_p = anchor.insert_paragraph_before(current_category)
-                        else:
-                            new_p = doc.add_paragraph(current_category)
-                        for run in new_p.runs:
-                            run.font.size = Pt(10)
-                        insert_pos += 1
+                    # Check if this line matches any of the generated category headers
+                    is_category_header = False
+                    category_name = None
+                    
+                    # Check against all generated category headers
+                    for header in category_headers:
+                        # Exact match or starts with header and has colon
+                        if line == header or line.startswith(header + ":"):
+                            category_name = header
+                            is_category_header = True
+                            break
+                        # Also check if line contains the header (for flexibility)
+                        elif header in line and (":" in line or len(line) < len(header) + 20):
+                            category_name = header
+                            is_category_header = True
+                            break
+                    
+                    if is_category_header and category_name:
+                        current_category = category_name
+                        # Only insert if not already inserted
+                        if category_name not in inserted_categories:
+                            inserted_categories.add(category_name)
+                            # Insert category header
+                            if insert_pos < len(doc.paragraphs):
+                                anchor = doc.paragraphs[insert_pos]
+                                new_p = anchor.insert_paragraph_before(category_name)
+                            else:
+                                new_p = doc.add_paragraph(category_name)
+                            for run in new_p.runs:
+                                run.font.size = Pt(10)
+                            insert_pos += 1
                         continue
                     
-                    # This is a bullet point (starts with - or • or number)
-                    if line.startswith('-') or line.startswith('•') or line.startswith('*') or (line[0].isdigit() and '.' in line[:3]):
-                        # Remove bullet markers
-                        bullet_text = line.lstrip('- •*0123456789. ')
-                        if bullet_text:
+                    # This is a bullet point (starts with - or • or number, or is a sentence)
+                    # Only process if we have a current category
+                    if current_category:
+                        # Check if it's a bullet (starts with marker) or a regular sentence
+                        is_bullet = line.startswith('-') or line.startswith('•') or line.startswith('*') or \
+                                   (line[0].isdigit() and '.' in line[:3])
+                        
+                        if is_bullet:
+                            # Remove bullet markers
+                            bullet_text = line.lstrip('- •*0123456789. ').strip()
+                        else:
+                            # Might be a sentence without bullet marker - treat as content
+                            bullet_text = line.strip()
+                        
+                        if bullet_text and len(bullet_text) > 10:  # Only add substantial content
                             # Insert as bullet paragraph
                             if insert_pos < len(doc.paragraphs):
                                 anchor = doc.paragraphs[insert_pos]
